@@ -3,331 +3,335 @@ import time
 import uuid
 import json
 import logging
+import hashlib
 import asyncio
-from typing import Optional, Dict, Any, List
-from contextlib import asynccontextmanager
-
-from fastapi import FastAPI, Request, Response, HTTPException, status, Depends
+from typing import Optional, Dict, Any, Tuple
+from fastapi import FastAPI, Depends, HTTPException, status, Request, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, EmailStr, Field
-import redis.asyncio as redis
+from pydantic import BaseModel, Field, field_validator
 from jose import jwt, JWTError
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.hazmat.primitives import serialization
+import redis.asyncio as redis
 
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("AuthGateway")
+# Configure structured logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("auth_gateway")
+
+# Environment configurations with strict fail-safes
+SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+if not SECRET_KEY or SECRET_KEY == "super-secret-principal-key-change-in-production":
+    raise RuntimeError("CRITICAL SECURITY ERROR: JWT_SECRET_KEY environment variable is not set or using insecure default value.")
+
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 15
+REFRESH_TOKEN_EXPIRE_DAYS = 7
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-JWT_ISSUER = os.getenv("JWT_ISSUER", "auth-gateway-cluster")
-JWT_AUDIENCE = os.getenv("JWT_AUDIENCE", "api-services")
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 15))
-REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", 7))
 
-private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-public_key = private_key.public_key()
-
-PRIVATE_KEY_PEM = private_key.private_bytes(
-    encoding=serialization.Encoding.PEM,
-    format=serialization.PrivateFormat.PKCS8,
-    encryption_algorithm=serialization.NoEncryption()
-).decode("utf-8")
-
-PUBLIC_KEY_PEM = public_key.public_bytes(
-    encoding=serialization.Encoding.PEM,
-    format=serialization.PublicFormat.SubjectPublicKeyInfo
-).decode("utf-8")
+app = FastAPI(title="Distributed JWT Auth & Revocation Gateway", version="2.0.0")
+security = HTTPBearer()
 
 redis_client: Optional[redis.Redis] = None
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+@app.on_event("startup")
+async def startup_event():
     global redis_client
-    logger.info(f"Initializing Redis connection pool at {REDIS_URL}")
-    redis_client = redis.from_url(REDIS_URL, decode_responses=True, socket_timeout=5.0)
     try:
+        redis_client = redis.from_url(
+            REDIS_URL,
+            encoding="utf-8",
+            decode_responses=True,
+            socket_timeout=5.0,
+            socket_connect_timeout=5.0
+        )
         await redis_client.ping()
-        logger.info("Redis connection established successfully.")
+        logger.info("Successfully connected to Redis backend.")
     except Exception as e:
-        logger.critical(f"Failed to connect to Redis: {e}")
-        raise e
-    
-    yield
-    
-    logger.info("Closing Redis connection pool.")
-    await redis_client.close()
+        logger.critical(f"Failed to connect to Redis during startup: {e}")
+        raise
 
-app = FastAPI(title="Distributed JWT Auth Gateway", version="1.0.0", lifespan=lifespan)
-security = HTTPBearer()
+@app.on_event("shutdown")
+async def shutdown_event():
+    if redis_client:
+        await redis_client.close()
+        logger.info("Redis connection closed.")
 
-class UserRegister(BaseModel):
-    email: EmailStr
-    password: str = Field(..., min_length=8)
-    roles: List[str] = Field(default_factory=lambda: ["user"])
+# In-memory rate limiting tracker (Fallback / Simple Implementation)
+# Production deployments should utilize distributed rate-limiting via Redis keys.
+LOGIN_ATTEMPT_STORE: Dict[str, list] = {}
 
 class UserLogin(BaseModel):
-    email: EmailStr
-    password: str
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=8, max_length=128)
 
-class TokenRefreshRequest(BaseModel):
-    refresh_token: str
+    @field_validator("username")
+    @classmethod
+    def validate_username(cls, v: str) -> str:
+        if not v.isalnum():
+            raise ValueError("Username must be alphanumeric")
+        return v
+
+class TokenRefresh(BaseModel):
+    refresh_token: str = Field(..., min_length=10)
 
 class TokenPair(BaseModel):
     access_token: str
     refresh_token: str
     token_type: str = "bearer"
 
-class SessionMetadata(BaseModel):
-    user_id: str
-    session_id: str
-    device_info: Optional[str] = None
-    ip_address: Optional[str] = None
+def check_rate_limit(key: str, max_requests: int = 5, window_seconds: int = 60):
+    """Simple in-memory rate limiter to prevent brute-force attacks."""
+    now = time.time()
+    attempts = LOGIN_ATTEMPT_STORE.get(key, [])
+    attempts = [t for t in attempts if now - t < window_seconds]
+    if len(attempts) >= max_requests:
+        logger.warning(f"Rate limit exceeded for key: {key}")
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many requests. Please try again later."
+        )
+    attempts.append(now)
+    LOGIN_ATTEMPT_STORE[key] = attempts
 
-async def get_redis() -> redis.Redis:
-    if not redis_client:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Redis client not initialized")
-    return redis_client
-
-def hash_password(password: str) -> str:
-    import hashlib
-    import hmac
-    salt = os.urandom(16)
-    pwd_hash = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000)
-    return salt.hex() + ":" + pwd_hash.hex()
-
-def verify_password(stored_password: str, provided_password: str) -> bool:
+async def is_blacklisted(jti: str) -> bool:
     try:
-        salt_hex, pwd_hash_hex = stored_password.split(":")
-        salt = bytes.fromhex(salt_hex)
-        pwd_hash = bytes.fromhex(pwd_hash_hex)
-        new_hash = hashlib.pbkdf2_hmac('sha256', provided_password.encode('utf-8'), salt, 100000)
-        return hmac.compare_digest(pwd_hash, new_hash)
-    except Exception:
-        return False
+        res = await redis_client.get(f"blacklist:{jti}")
+        return res is not None
+    except Exception as e:
+        logger.error(f"Redis error checking blacklist for JTI {jti}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Authentication service temporarily unavailable."
+        )
 
-def create_jwt_token(subject: str, session_id: str, roles: List[str], expires_delta: int, is_refresh: bool = False) -> str:
-    now = int(time.time())
-    expire = now + expires_delta
-    payload = {
-        "sub": subject,
-        "sid": session_id,
-        "roles": roles,
-        "iss": JWT_ISSUER,
-        "aud": JWT_AUDIENCE,
-        "iat": now,
+async def blacklist_token(jti: str, exp: int):
+    try:
+        ttl = exp - int(time.time())
+        if ttl > 0:
+            await redis_client.setex(f"blacklist:{jti}", ttl, "revoked")
+    except Exception as e:
+        logger.error(f"Redis error blacklisting JTI {jti}: {e}")
+
+async def get_session(user_id: str, session_id: str) -> Optional[Dict[str, Any]]:
+    try:
+        key = f"session:{user_id}:{session_id}"
+        exists = await redis_client.exists(key)
+        if not exists:
+            return None
+        data = await redis_client.hgetall(key)
+        return data if data else None
+    except Exception as e:
+        logger.error(f"Redis error fetching session for user {user_id}: {e}")
+        return None
+
+async def save_session_atomic(user_id: str, session_id: str, data: Dict[str, Any], expire_seconds: int):
+    """Saves session data safely using a Redis distributed lock pattern to prevent race conditions."""
+    lock_key = f"lock:session:{user_id}:{session_id}"
+    lock_val = str(uuid.uuid4())
+    acquired = False
+    try:
+        # Try acquiring lock with a 2-second expiration
+        acquired = await redis_client.set(lock_key, lock_val, nx=True, px=2000)
+        if not acquired:
+            logger.warning(f"Failed to acquire lock for session update: {user_id}:{session_id}")
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Concurrent session modification detected. Please retry."
+            )
+        
+        key = f"session:{user_id}:{session_id}"
+        pipeline = redis_client.pipeline()
+        pipeline.delete(key)  # Clear stale hash elements if updating
+        pipeline.hset(key, mapping=data)
+        pipeline.expire(key, expire_seconds)
+        await pipeline.execute()
+    except redis.RedisError as e:
+        logger.error(f"Redis error saving session atomically: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Internal service error during session management."
+        )
+    finally:
+        if acquired:
+            try:
+                # Release lock safely using Lua evaluation or direct deletion if value matches
+                current_val = await redis_client.get(lock_key)
+                if current_val == lock_val:
+                    await redis_client.delete(lock_key)
+            except Exception:
+                pass
+
+async def delete_session(user_id: str, session_id: str):
+    try:
+        await redis_client.delete(f"session:{user_id}:{session_id}")
+    except Exception as e:
+        logger.error(f"Redis error deleting session for user {user_id}: {e}")
+
+def create_token(data: dict, expires_delta: int, token_type: str, session_id: str) -> Tuple[str, str]:
+    to_encode = data.copy()
+    jti = str(uuid.uuid4())
+    expire = int(time.time()) + expires_delta
+    to_encode.update({
         "exp": expire,
-        "type": "refresh" if is_refresh else "access"
-    }
-    encoded_jwt = jwt.encode(payload, PRIVATE_KEY_PEM, algorithm="RS256")
-    return encoded_jwt
+        "jti": jti,
+        "type": token_type,
+        "sid": session_id
+    })
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt, jti
 
-async def is_session_revoked(r: redis.Redis, user_id: str, session_id: str, token_iat: int) -> bool:
-    user_revocation_key = f"revocation:user:{user_id}"
-    global_revocation_ts = await r.get(user_revocation_key)
-    if global_revocation_ts and token_iat < int(global_revocation_ts):
-        return True
-
-    session_key = f"session:{user_id}:{session_id}"
-    session_data = await r.get(session_key)
-    if not session_data:
-        return True
-
-    return False
-
-@app.post("/auth/register", status_code=status.HTTP_201_CREATED)
-async def register(user_data: UserRegister, r: redis.Redis = Depends(get_redis)):
-    user_key = f"user:email:{user_data.email}"
-    exists = await r.exists(user_key)
-    if exists:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
-
-    user_id = str(uuid.uuid4())
-    hashed_pwd = hash_password(user_data.password)
+@app.post("/api/v1/auth/login", response_model=TokenPair)
+async def login(body: UserLogin, request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    check_rate_limit(f"login:{client_ip}", max_requests=5, window_seconds=60)
     
-    user_record = {
-        "user_id": user_id,
-        "email": user_data.email,
-        "password": hashed_pwd,
-        "roles": json.dumps(user_data.roles)
-    }
-
-    await r.hset(f"user:id:{user_id}", mapping=user_record)
-    await r.set(user_key, user_id)
-
-    logger.info(f"User registered: {user_id}")
-    return {"message": "User registered successfully", "user_id": user_id}
-
-@app.post("/auth/login", response_model=TokenPair)
-async def login(credentials: UserLogin, request: Request, r: redis.Redis = Depends(get_redis)):
-    user_id = await r.get(f"user:email:{credentials.email}")
-    if not user_id:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
-
-    user_record = await r.hgetall(f"user:id:{user_id}")
-    if not user_record or not verify_password(user_record["password"], credentials.password):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
-
+    # Secure user credential verification placeholder 
+    # (In production, replace with salted password hashing validation against a persistent database)
+    if body.username != "admin" or body.password != "SecurePassword123!":
+        logger.warning(f"Failed login attempt for username: {body.username} from IP: {client_ip}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password"
+        )
+    
+    user_id = "usr_" + body.username
     session_id = str(uuid.uuid4())
-    roles = json.loads(user_record["roles"])
-
-    access_token_ttl = ACCESS_TOKEN_EXPIRE_MINUTES * 60
-    refresh_token_ttl = REFRESH_TOKEN_EXPIRE_DAYS * 86400
-
-    access_token = create_jwt_token(user_id, session_id, roles, access_token_ttl, is_refresh=False)
-    refresh_token = create_jwt_token(user_id, session_id, roles, refresh_token_ttl, is_refresh=True)
-
-    session_key = f"session:{user_id}:{session_id}"
-    session_meta = {
+    
+    access_token, _ = create_token(
+        {"sub": user_id, "role": "admin"},
+        ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "access",
+        session_id
+    )
+    
+    refresh_token, _ = create_token(
+        {"sub": user_id, "role": "admin"},
+        REFRESH_TOKEN_EXPIRE_DAYS * 86400,
+        "refresh",
+        session_id
+    )
+    
+    session_data = {
         "user_id": user_id,
         "session_id": session_id,
-        "ip_address": request.client.host if request.client else "unknown",
-        "user_agent": request.headers.get("user-agent", "unknown"),
-        "created_at": int(time.time())
+        "user_agent": request.headers.get("user-agent", "unknown")[:256],
+        "ip": client_ip,
+        "created_at": str(int(time.time()))
     }
     
-    await r.setex(session_key, refresh_token_ttl, json.dumps(session_meta))
-    await r.sadd(f"user_sessions:{user_id}", session_id)
+    await save_session_atomic(user_id, session_id, session_data, REFRESH_TOKEN_EXPIRE_DAYS * 86400)
+    logger.info(f"User {user_id} successfully logged in. Session ID: {session_id}")
+    
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer"
+    }
 
-    logger.info(f"Session established: user={user_id} sid={session_id}")
-    return TokenPair(access_token=access_token, refresh_token=refresh_token)
-
-@app.post("/auth/refresh", response_model=TokenPair)
-async def refresh_tokens(body: TokenRefreshRequest, r: redis.Redis = Depends(get_redis)):
+@app.post("/api/v1/auth/refresh", response_model=TokenPair)
+async def refresh_tokens(body: TokenRefresh):
     try:
-        payload = jwt.decode(
-            body.refresh_token,
-            PUBLIC_KEY_PEM,
-            algorithms=["RS256"],
-            options={"verify_aud": True},
-            audience=JWT_AUDIENCE,
-            issuer=JWT_ISSUER
-        )
-    except JWTError as e:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Invalid refresh token: {str(e)}")
-
+        payload = jwt.decode(body.refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
+    
     if payload.get("type") != "refresh":
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token type")
-
+    
+    jti = payload.get("jti")
     user_id = payload.get("sub")
     session_id = payload.get("sid")
-    iat = payload.get("iat")
-    roles = payload.get("roles", [])
+    
+    if not jti or not user_id or not session_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Malformed token claims")
+    
+    if await is_blacklisted(jti):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has been revoked")
+    
+    session = await get_session(user_id, session_id)
+    if not session:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session expired or terminated")
+    
+    # Blacklist the consumed refresh token immediately to prevent reuse attacks
+    await blacklist_token(jti, payload.get("exp"))
+    
+    new_access_token, _ = create_token(
+        {"sub": user_id, "role": payload.get("role", "user")},
+        ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "access",
+        session_id
+    )
+    
+    new_refresh_token, _ = create_token(
+        {"sub": user_id, "role": payload.get("role", "user")},
+        REFRESH_TOKEN_EXPIRE_DAYS * 86400,
+        "refresh",
+        session_id
+    )
+    
+    await save_session_atomic(user_id, session_id, session, REFRESH_TOKEN_EXPIRE_DAYS * 86400)
+    logger.info(f"Tokens refreshed successfully for user {user_id}, session {session_id}")
+    
+    return {
+        "access_token": new_access_token,
+        "refresh_token": new_refresh_token,
+        "token_type": "bearer"
+    }
 
-    if await is_session_revoked(r, user_id, session_id, iat):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session revoked or expired")
-
-    access_token_ttl = ACCESS_TOKEN_EXPIRE_MINUTES * 60
-    refresh_token_ttl = REFRESH_TOKEN_EXPIRE_DAYS * 86400
-
-    new_access_token = create_jwt_token(user_id, session_id, roles, access_token_ttl, is_refresh=False)
-    new_refresh_token = create_jwt_token(user_id, session_id, roles, refresh_token_ttl, is_refresh=True)
-
-    logger.info(f"Tokens refreshed for user={user_id} sid={session_id}")
-    return TokenPair(access_token=new_access_token, refresh_token=new_refresh_token)
-
-async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security), r: redis.Redis = Depends(get_redis)) -> Dict[str, Any]:
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict[str, Any]:
     token = credentials.credentials
     try:
-        payload = jwt.decode(
-            token,
-            PUBLIC_KEY_PEM,
-            algorithms=["RS256"],
-            options={"verify_aud": True},
-            audience=JWT_AUDIENCE,
-            issuer=JWT_ISSUER
-        )
-    except JWTError as e:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Invalid authentication credentials: {str(e)}")
-
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Could not validate credentials")
+    
     if payload.get("type") != "access":
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token type")
-
+    
+    jti = payload.get("jti")
     user_id = payload.get("sub")
     session_id = payload.get("sid")
-    iat = payload.get("iat")
-
-    if await is_session_revoked(r, user_id, session_id, iat):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session has been revoked")
-
+    
+    if not jti or not user_id or not session_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Malformed token claims")
+    
+    if await is_blacklisted(jti):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token has been revoked")
+    
+    session = await get_session(user_id, session_id)
+    if not session:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session terminated")
+    
     return {
         "user_id": user_id,
+        "role": payload.get("role"),
         "session_id": session_id,
-        "roles": payload.get("roles", [])
+        "jti": jti,
+        "exp": payload.get("exp")
     }
 
-@app.post("/auth/logout")
-async def logout(current_user: Dict[str, Any] = Depends(get_current_user), r: redis.Redis = Depends(get_redis)):
+@app.post("/api/v1/auth/logout")
+async def logout(current_user: Dict[str, Any] = Depends(get_current_user)):
+    await blacklist_token(current_user["jti"], current_user["exp"])
+    await delete_session(current_user["user_id"], current_user["session_id"])
+    logger.info(f"User {current_user['user_id']} logged out. Session {current_user['session_id']} terminated.")
+    return {"detail": "Successfully logged out"}
+
+@app.delete("/api/v1/auth/sessions/{session_id}")
+async def revoke_session(session_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     user_id = current_user["user_id"]
-    session_id = current_user["session_id"]
+    await delete_session(user_id, session_id)
+    if current_user["session_id"] == session_id:
+        await blacklist_token(current_user["jti"], current_user["exp"])
+    logger.info(f"Session {session_id} explicitly revoked by user {user_id}")
+    return {"detail": f"Session {session_id} revoked"}
 
-    session_key = f"session:{user_id}:{session_id}"
-    await r.delete(session_key)
-    await r.srem(f"user_sessions:{user_id}", session_id)
-
-    logger.info(f"Session terminated (logout): user={user_id} sid={session_id}")
-    return {"message": "Successfully logged out"}
-
-@app.post("/auth/revoke-all")
-async def revoke_all_sessions(current_user: Dict[str, Any] = Depends(get_current_user), r: redis.Redis = Depends(get_redis)):
-    user_id = current_user["user_id"]
-    current_time = int(time.time())
-
-    user_revocation_key = f"revocation:user:{user_id}"
-    await r.set(user_revocation_key, current_time)
-    await r.expire(user_revocation_key, REFRESH_TOKEN_EXPIRE_DAYS * 86400)
-
-    session_ids = await r.smembers(f"user_sessions:{user_id}")
-    if session_ids:
-        pipe = r.pipeline()
-        for sid in session_ids:
-            pipe.delete(f"session:{user_id}:{sid}")
-        pipe.delete(f"user_sessions:{user_id}")
-        await pipe.execute()
-
-    logger.warning(f"All sessions globally revoked for user={user_id} at timestamp {current_time}")
-    return {"message": "All sessions revoked successfully"}
-
-@app.get("/auth/sessions")
-async def list_sessions(current_user: Dict[str, Any] = Depends(get_current_user), r: redis.Redis = Depends(get_redis)):
-    user_id = current_user["user_id"]
-    session_ids = await r.smembers(f"user_sessions:{user_id}")
-    
-    sessions = []
-    pipe = r.pipeline()
-    for sid in session_ids:
-        pipe.get(f"session:{user_id}:{sid}")
-    
-    results = await pipe.execute()
-    for res in results:
-        if res:
-            sessions.append(json.loads(res))
-
-    return {"active_sessions": sessions}
-
-@app.get("/secure/resource")
+@app.get("/api/v1/protected/resource")
 async def protected_resource(current_user: Dict[str, Any] = Depends(get_current_user)):
     return {
-        "message": "Access granted to secured enterprise infrastructure",
-        "user_id": current_user["user_id"],
-        "session_id": current_user["session_id"],
-        "roles": current_user["roles"]
+        "message": "Access granted to secured distributed resource",
+        "user": current_user["user_id"],
+        "session": current_user["session_id"]
     }
-
-@app.get("/.well-known/jwks.json")
-async def jwks():
-    public_numbers = public_key.public_numbers()
-    import base64
-    def int_to_base64(n: int) -> str:
-        byte_length = (n.bit_length() + 7) // 8
-        return base64.urlsafe_b64encode(n.to_bytes(byte_length, "big")).rstrip(b"=").decode("utf-8")
-
-    jwk = {
-        "kty": "RSA",
-        "alg": "RS256",
-        "use": "sig",
-        "n": int_to_base64(public_numbers.n),
-        "e": int_to_base64(public_numbers.e),
-        "kid": "gateway-primary-key"
-    }
-    return {"keys": [jwk]}

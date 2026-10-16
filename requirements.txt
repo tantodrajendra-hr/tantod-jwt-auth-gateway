@@ -1,6 +1,5 @@
 fastapi
+uvicorn
 pydantic
+python-jose[cryptography]
 redis
-python-jose
-cryptography
-email-validator
