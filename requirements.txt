@@ -1,0 +1,6 @@
+fastapi
+pydantic
+redis
+python-jose
+cryptography
+email-validator
